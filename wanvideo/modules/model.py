@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
-
+from einops import repeat, rearrange
 from ...enhance_a_video.enhance import get_feta_scores
 from ...enhance_a_video.globals import is_enhance_enabled
 
@@ -17,6 +17,44 @@ from tqdm import tqdm
 import gc
 import comfy.model_management as mm
 from ...utils import log, get_module_memory_mb
+
+from comfy.ldm.flux.math import apply_rope as apply_rope_comfy
+
+def rope_riflex(pos, dim, theta, L_test, k, temporal):
+    assert dim % 2 == 0
+    if mm.is_device_mps(pos.device) or mm.is_intel_xpu() or mm.is_directml_enabled():
+        device = torch.device("cpu")
+    else:
+        device = pos.device
+
+    scale = torch.linspace(0, (dim - 2) / dim, steps=dim//2, dtype=torch.float64, device=device)
+    omega = 1.0 / (theta**scale)
+
+    # RIFLEX modification - adjust last frequency component if L_test and k are provided
+    if temporal and k > 0 and L_test:
+        omega[k-1] = 0.9 * 2 * torch.pi / L_test
+
+    out = torch.einsum("...n,d->...nd", pos.to(dtype=torch.float32, device=device), omega)
+    out = torch.stack([torch.cos(out), -torch.sin(out), torch.sin(out), torch.cos(out)], dim=-1)
+    out = rearrange(out, "b n d (i j) -> b n d i j", i=2, j=2)
+    return out.to(dtype=torch.float32, device=pos.device)
+
+class EmbedND_RifleX(nn.Module):
+    def __init__(self, dim, theta, axes_dim, num_frames, k):
+        super().__init__()
+        self.dim = dim
+        self.theta = theta
+        self.axes_dim = axes_dim
+        self.num_frames = num_frames
+        self.k = k
+
+    def forward(self, ids):
+        n_axes = ids.shape[-1]
+        emb = torch.cat(
+            [rope_riflex(ids[..., i], self.axes_dim[i], self.theta, self.num_frames, self.k, temporal=True if i == 0 else False) for i in range(n_axes)],
+            dim=-3,
+        )
+        return emb.unsqueeze(1)
 
 def poly1d(coefficients, x):
     result = torch.zeros_like(x)
@@ -142,7 +180,7 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs):
+    def forward(self, x, seq_lens, grid_sizes, freqs, rope_func = "default"):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -161,32 +199,109 @@ class WanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
-        if self.attention_mode == 'spargeattn_tune' or self.attention_mode == 'spargeattn':
-            tune_mode = False
-            if self.attention_mode == 'spargeattn_tune':
-                tune_mode = True
-                
-            if hasattr(self, 'inner_attention'):
-                #print("has inner attention")
-                q=rope_apply(q, grid_sizes, freqs)
-                k=rope_apply(k, grid_sizes, freqs)
-                q = q.permute(0, 2, 1, 3)
-                k = k.permute(0, 2, 1, 3)
-                v = v.permute(0, 2, 1, 3)
-                x = self.inner_attention(
-                    q=q, 
-                    k=k,
-                    v=v, 
-                    is_causal=False, 
-                    tune_mode=tune_mode
-                    ).permute(0, 2, 1, 3)
-                #print("inner attention", x.shape) #inner attention torch.Size([1, 12, 32760, 128])
+        if rope_func == "comfy":
+            q, k = apply_rope_comfy(q, k, freqs)
         else:
             q=rope_apply(q, grid_sizes, freqs)
             k=rope_apply(k, grid_sizes, freqs)
-            if is_enhance_enabled():
-                feta_scores = get_feta_scores(q, k)
 
+        if is_enhance_enabled():
+            feta_scores = get_feta_scores(q, k)
+
+        x = attention(
+            q=q,
+            k=k,
+            v=v,
+            k_lens=seq_lens,
+            window_size=self.window_size,
+            attention_mode=self.attention_mode)
+
+        # output
+        x = x.flatten(2)
+        x = self.o(x)
+
+        if is_enhance_enabled():
+            x *= feta_scores
+
+        return x
+    
+    def forward_split(self, x, seq_lens, grid_sizes, freqs, seq_chunks=1,current_step=0, video_attention_split_steps = [], rope_func = "default"):
+        r"""
+        Args:
+            x(Tensor): Shape [B, L, num_heads, C / num_heads]
+            seq_lens(Tensor): Shape [B]
+            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
+            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+        """
+        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+
+        # query, key, value function
+        def qkv_fn(x):
+            q = self.norm_q(self.q(x)).view(b, s, n, d)
+            k = self.norm_k(self.k(x)).view(b, s, n, d)
+            v = self.v(x).view(b, s, n, d)
+            return q, k, v
+
+        q, k, v = qkv_fn(x)
+
+        if rope_func == "comfy":
+            q, k = apply_rope_comfy(q, k, freqs)
+        else:
+            q=rope_apply(q, grid_sizes, freqs)
+            k=rope_apply(k, grid_sizes, freqs)
+
+        if is_enhance_enabled():
+            feta_scores = get_feta_scores(q, k)
+
+        # Split by frames if multiple prompts are provided
+        if seq_chunks > 1 and current_step in video_attention_split_steps:
+            outputs = []
+            # Extract frame, height, width from grid_sizes - force to CPU scalars
+            frames = grid_sizes[0][0].item()
+            height = grid_sizes[0][1].item()
+            width = grid_sizes[0][2].item()
+            tokens_per_frame = height * width
+            
+            actual_chunks = min(seq_chunks, frames)
+            if isinstance(actual_chunks, torch.Tensor):
+                actual_chunks = actual_chunks.item()
+            
+            frame_chunks = []  # Pre-calculate all chunk boundaries
+            start_frame = 0
+            base_frames_per_chunk = frames // actual_chunks
+            extra_frames = frames % actual_chunks
+            
+            # Pre-calculate all chunks
+            for i in range(actual_chunks):
+                chunk_size = base_frames_per_chunk + (1 if i < extra_frames else 0)
+                end_frame = start_frame + chunk_size
+                frame_chunks.append((start_frame, end_frame))
+                start_frame = end_frame
+            
+            # Process each chunk using the pre-calculated boundaries
+            for start_frame, end_frame in frame_chunks:
+                # Convert to token indices
+                start_idx = int(start_frame * tokens_per_frame)
+                end_idx = int(end_frame * tokens_per_frame)
+                
+                chunk_q = q[:, start_idx:end_idx, :, :]
+                chunk_k = k[:, start_idx:end_idx, :, :]
+                chunk_v = v[:, start_idx:end_idx, :, :]
+                
+                chunk_out = attention(
+                    q=chunk_q,
+                    k=chunk_k,
+                    v=chunk_v,
+                    k_lens=seq_lens,
+                    window_size=self.window_size,
+                    attention_mode=self.attention_mode)
+                
+                outputs.append(chunk_out)
+            
+            # Concatenate outputs along the sequence dimension
+            x = torch.cat(outputs, dim=1)
+        else:
+            # Original attention computation
             x = attention(
                 q=q,
                 k=k,
@@ -207,7 +322,7 @@ class WanSelfAttention(nn.Module):
 
 class WanT2VCrossAttention(WanSelfAttention):
 
-    def forward(self, x, context, context_lens):
+    def forward(self, x, context, context_lens, clip_embed=None):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
@@ -247,31 +362,33 @@ class WanI2VCrossAttention(WanSelfAttention):
         self.norm_k_img = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.attention_mode = attention_mode
 
-    def forward(self, x, context, context_lens):
+    def forward(self, x, context, context_lens, clip_embed):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
         """
-        context_img = context[:, :257]
-        context = context[:, 257:]
+        #context_img = context[:, :clip_embed.shape[1]]
+        #context = context[:, clip_embed.shape[1]:]
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
         # compute query, key, value
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
         k = self.norm_k(self.k(context)).view(b, -1, n, d)
         v = self.v(context).view(b, -1, n, d)
-        k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
-        v_img = self.v_img(context_img).view(b, -1, n, d)
-        img_x = attention(q, k_img, v_img, k_lens=None, attention_mode=self.attention_mode)
+        if clip_embed is not None:
+            k_img = self.norm_k_img(self.k_img(clip_embed)).view(b, -1, n, d)
+            v_img = self.v_img(clip_embed).view(b, -1, n, d)
+            img_x = attention(q, k_img, v_img, k_lens=None, attention_mode=self.attention_mode)
         # compute attention
         x = attention(q, k, v, k_lens=context_lens, attention_mode=self.attention_mode)
 
         # output
         x = x.flatten(2)
-        img_x = img_x.flatten(2)
-        x = x + img_x
+        if clip_embed is not None:
+            img_x = img_x.flatten(2)
+            x = x + img_x
         x = self.o(x)
         return x
 
@@ -334,6 +451,11 @@ class WanAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
+        current_step,
+        video_attention_split_steps=[],
+        rope_func = "default",
+        clip_embed=None,
+        
     ):
         r"""
         Args:
@@ -343,26 +465,160 @@ class WanAttentionBlock(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
-        assert e.dtype == torch.float32
-        e = (self.modulation.to(torch.float32).to(e.device) + e.to(torch.float32)).chunk(6, dim=1)
-        assert e[0].dtype == torch.float32
+        e = (self.modulation.to(e.device) + e).chunk(6, dim=1)
 
         # self-attention
-        y = self.self_attn(
-            self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes,
-            freqs)
+        if (context.shape[0] > 1 or (clip_embed is not None and clip_embed.shape[0] > 1)) and x.shape[0] == 1:
+             y = self.self_attn.forward_split(
+            self.norm1(x) * (1 + e[1]) + e[0], 
+            seq_lens, grid_sizes,
+            freqs, rope_func=rope_func, 
+            seq_chunks=max(context.shape[0], clip_embed.shape[0] if clip_embed is not None else 0),
+            current_step=current_step,
+            video_attention_split_steps=video_attention_split_steps
+            )
+        else:
+            y = self.self_attn.forward(
+            self.norm1(x) * (1 + e[1]) + e[0], 
+            seq_lens, grid_sizes,
+            freqs, rope_func=rope_func
+            )
+        
         x = x.to(torch.float32) + (y.to(torch.float32) * e[2].to(torch.float32))
 
         # cross-attention & ffn function
-        def cross_attn_ffn(x, context, context_lens, e):
-            x = x + self.cross_attn(self.norm3(x), context, context_lens)
-            y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
-            x = x.to(torch.float32) + (y.to(torch.float32) * e[5].to(torch.float32))
-            return x
+        if (context.shape[0] > 1 or (clip_embed is not None and clip_embed.shape[0] > 1)) and x.shape[0] == 1:
+            x = self.split_cross_attn_ffn(x, context, context_lens, e, clip_embed=clip_embed, grid_sizes=grid_sizes)
+        else:
+            x = self.cross_attn_ffn(x, context, context_lens, e, clip_embed=clip_embed, grid_sizes=grid_sizes)
 
-        x = cross_attn_ffn(x, context, context_lens, e)
         return x
+    
+    def cross_attn_ffn(self, x, context, context_lens, e, clip_embed=None, grid_sizes=None):
+            x = x + self.cross_attn(self.norm3(x), context, context_lens, clip_embed=clip_embed)
+            y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
+            x = x.to(torch.float32) + (y.to(torch.float32) * e[5])
+            return x
+    
+    @torch.compiler.disable()
+    def split_cross_attn_ffn(self, x, context, context_lens, e, clip_embed=None, grid_sizes=None):
+        # Get number of prompts
+        num_prompts = context.shape[0]
+        num_clip_embeds = 0 if clip_embed is None else clip_embed.shape[0]
+        num_segments = max(num_prompts, num_clip_embeds)
+        
+        # Extract spatial dimensions
+        frames, height, width = grid_sizes[0]  # Assuming batch size 1
+        tokens_per_frame = height * width
+        
+        # Distribute frames across prompts
+        frames_per_segment = max(1, frames // num_segments)
+        
+        # Process each prompt segment
+        x_combined = torch.zeros_like(x)
+        
+        for i in range(num_segments):
+            # Calculate frame boundaries for this segment
+            start_frame = i * frames_per_segment
+            end_frame = min((i+1) * frames_per_segment, frames) if i < num_segments-1 else frames
+            
+            # Convert frame indices to token indices
+            start_idx = start_frame * tokens_per_frame
+            end_idx = end_frame * tokens_per_frame
+            segment_indices = torch.arange(start_idx, end_idx, device=x.device, dtype=torch.long)
+            
+            # Get prompt segment (cycle through available prompts if needed)
+            prompt_idx = i % num_prompts
+            segment_context = context[prompt_idx:prompt_idx+1]
+            segment_context_lens = None
+            if context_lens is not None:
+                segment_context_lens = context_lens[prompt_idx:prompt_idx+1]
+            
+            # Handle clip_embed for this segment (cycle through available embeddings)
+            segment_clip_embed = None
+            if clip_embed is not None:
+                clip_idx = i % num_clip_embeds
+                segment_clip_embed = clip_embed[clip_idx:clip_idx+1]
+            
+            # Get tensor segment
+            x_segment = x[:, segment_indices, :]
+            
+            # Process segment with its prompt and clip embedding
+            processed_segment = self.cross_attn(self.norm3(x_segment), segment_context, segment_context_lens, clip_embed=segment_clip_embed)
+            processed_segment = processed_segment.to(x.dtype)
+            
+            # Add to combined result
+            x_combined[:, segment_indices, :] = processed_segment
+        
+        # Continue with FFN
+        x = x + x_combined
+        y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
+        x = x.to(torch.float32) + (y.to(torch.float32) * e[5].to(torch.float32))
+        return x            
 
+class VaceWanAttentionBlock(WanAttentionBlock):
+    def __init__(
+            self,
+            cross_attn_type,
+            dim,
+            ffn_dim,
+            num_heads,
+            window_size=(-1, -1),
+            qk_norm=True,
+            cross_attn_norm=False,
+            eps=1e-6,
+            block_id=0
+    ):
+        super().__init__(cross_attn_type, dim, ffn_dim, num_heads, window_size, qk_norm, cross_attn_norm, eps)
+        self.block_id = block_id
+        if block_id == 0:
+            self.before_proj = nn.Linear(self.dim, self.dim)
+            nn.init.zeros_(self.before_proj.weight)
+            nn.init.zeros_(self.before_proj.bias)
+        self.after_proj = nn.Linear(self.dim, self.dim)
+        nn.init.zeros_(self.after_proj.weight)
+        nn.init.zeros_(self.after_proj.bias)
+
+    def forward(self, c_list, x, intermediate_device=None, nonblocking=True, **kwargs):
+        if self.block_id == 0:
+            c = self.before_proj(c_list[0]) + x
+            all_c = []
+        else:
+            all_c = c_list
+            c = all_c.pop(-1)
+        c = super().forward(c, **kwargs)
+        c_skip = self.after_proj(c)
+
+        all_c += [c_skip.to(intermediate_device, non_blocking=nonblocking), c]
+        
+        return all_c
+
+class BaseWanAttentionBlock(WanAttentionBlock):
+    def __init__(
+        self,
+        cross_attn_type,
+        dim,
+        ffn_dim,
+        num_heads,
+        window_size=(-1, -1),
+        qk_norm=True,
+        cross_attn_norm=False,
+        eps=1e-6,
+        block_id=None,
+        attention_mode='sdpa'
+    ):
+        super().__init__(cross_attn_type, dim, ffn_dim, num_heads, window_size, qk_norm, cross_attn_norm, eps, attention_mode)
+        self.block_id = block_id
+
+    def forward(self, x, vace_hints=None, vace_context_scale=[1.0], **kwargs):
+        x = super().forward(x, **kwargs)
+        if vace_hints is None:
+            return x
+        
+        if self.block_id is not None:
+            for i in range(len(vace_hints)):
+                x = x + vace_hints[i][self.block_id].to(x.device) * vace_context_scale[i]
+        return x
 
 class Head(nn.Module):
 
@@ -388,10 +644,9 @@ class Head(nn.Module):
             e(Tensor): Shape [B, C]
         """
         assert e.dtype == torch.float32
-        e_unsqueezed = e.unsqueeze(1).to(torch.float32)
-        e = (self.modulation.to(torch.float32).to(e.device) + e_unsqueezed).chunk(2, dim=1)
-        normed = self.norm(x).to(torch.float32)
-        x = self.head(normed * (1 + e[1].to(torch.float32)) + e[0].to(torch.float32))
+        e = (self.modulation.to(e.device) + e.unsqueeze(1)).chunk(2, dim=1)
+        normed = self.norm(x)
+        x = self.head(normed * (1 + e[1]) + e[0])
         return x
 
 
@@ -440,7 +695,10 @@ class WanModel(ModelMixin, ConfigMixin):
                  attention_mode='sdpa',
                  main_device=torch.device('cuda'),
                  offload_device=torch.device('cpu'),
-                 teacache_coefficients=[],):
+                 teacache_coefficients=[],
+                 vace_layers=None,
+                 vace_in_dim=None
+                 ):
         r"""
         Initialize the diffusion model backbone.
 
@@ -503,19 +761,26 @@ class WanModel(ModelMixin, ConfigMixin):
         self.blocks_to_swap = -1
         self.offload_txt_emb = False
         self.offload_img_emb = False
+        self.vace_blocks_to_swap = -1
 
         #init TeaCache variables
         self.enable_teacache = False
         self.rel_l1_thresh = 0.15
         self.teacache_start_step= 0
         self.teacache_end_step = -1
-        self.teacache_cache_device = main_device
-        self.teacache_state = TeaCacheState()
+        self.teacache_cache_device = offload_device
+        self.teacache_state = TeaCacheState(cache_device=self.teacache_cache_device)
         self.teacache_coefficients = teacache_coefficients
         self.teacache_use_coefficients = False
-        # self.l1_history_x = []
-        # self.l1_history_temb = []
-        # self.l1_history_rescaled = []
+        self.teacache_mode = 'e'
+
+        self.slg_blocks = None
+        self.slg_start_percent = 0.0
+        self.slg_end_percent = 1.0
+
+        self.use_non_blocking = True
+
+        self.video_attention_split_steps = []
 
         # embeddings
         self.patch_embedding = nn.Conv3d(
@@ -532,17 +797,52 @@ class WanModel(ModelMixin, ConfigMixin):
             nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
 
-        # blocks
-        cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
-        self.blocks = nn.ModuleList([
-            WanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
+        if vace_layers is not None:
+            self.vace_layers = [i for i in range(0, self.num_layers, 2)] if vace_layers is None else vace_layers
+            self.vace_in_dim = self.in_dim if vace_in_dim is None else vace_in_dim
+
+            self.vace_layers_mapping = {i: n for n, i in enumerate(self.vace_layers)}
+
+            # vace blocks
+            self.vace_blocks = nn.ModuleList([
+                VaceWanAttentionBlock('t2v_cross_attn', self.dim, self.ffn_dim, self.num_heads, self.window_size, self.qk_norm,
+                                        self.cross_attn_norm, self.eps, block_id=i)
+                for i in self.vace_layers
+            ])
+
+            # vace patch embeddings
+            self.vace_patch_embedding = nn.Conv3d(
+                self.vace_in_dim, self.dim, kernel_size=self.patch_size, stride=self.patch_size
+            )
+            self.blocks = nn.ModuleList([
+            BaseWanAttentionBlock('t2v_cross_attn', dim, ffn_dim, num_heads,
                               window_size, qk_norm, cross_attn_norm, eps,
-                              attention_mode=self.attention_mode)
-            for _ in range(num_layers)
-        ])
+                              attention_mode=self.attention_mode,
+                              block_id=self.vace_layers_mapping[i] if i in self.vace_layers else None)
+            for i in range(num_layers)
+            ])
+        else:
+            # blocks
+            cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
+            self.blocks = nn.ModuleList([
+                WanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
+                                window_size, qk_norm, cross_attn_norm, eps,
+                                attention_mode=self.attention_mode)
+                for _ in range(num_layers)
+            ])
 
         # head
         self.head = Head(dim, out_dim, patch_size, eps)
+        
+
+        d = self.dim // self.num_heads
+        self.rope_embedder = EmbedND_RifleX(
+            d, 
+            10000.0, 
+            [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)],
+            num_frames=None,
+            k=None,
+            )
 
         # buffers (don't use register_buffer otherwise dtype will be changed in to())
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
@@ -551,12 +851,10 @@ class WanModel(ModelMixin, ConfigMixin):
         if model_type == 'i2v':
             self.img_emb = MLPProj(1280, dim)
 
-        # initialize weights
-        #self.init_weights()
-
-    def block_swap(self, blocks_to_swap, offload_txt_emb=False, offload_img_emb=False):
-        print(f"Swapping {blocks_to_swap + 1} transformer blocks")
+    def block_swap(self, blocks_to_swap, offload_txt_emb=False, offload_img_emb=False, vace_blocks_to_swap=None):
+        log.info(f"Swapping {blocks_to_swap + 1} transformer blocks")
         self.blocks_to_swap = blocks_to_swap
+        
         self.offload_img_emb = offload_img_emb
         self.offload_txt_emb = offload_txt_emb
 
@@ -570,19 +868,69 @@ class WanModel(ModelMixin, ConfigMixin):
                 block.to(self.main_device)
                 total_main_memory += block_memory
             else:
-                block.to(self.offload_device)
+                block.to(self.offload_device, non_blocking=self.use_non_blocking)
                 total_offload_memory += block_memory
+
+        if blocks_to_swap != -1 and vace_blocks_to_swap == 0:
+            vace_blocks_to_swap = 1
+
+        if vace_blocks_to_swap > 0 and self.vace_layers is not None:
+            self.vace_blocks_to_swap = vace_blocks_to_swap
+
+            for b, block in tqdm(enumerate(self.vace_blocks), total=len(self.vace_blocks), desc="Initializing vace block swap"):
+                block_memory = get_module_memory_mb(block)
+                
+                if b > self.vace_blocks_to_swap:
+                    block.to(self.main_device)
+                    total_main_memory += block_memory
+                else:
+                    block.to(self.offload_device, non_blocking=self.use_non_blocking)
+                    total_offload_memory += block_memory
 
         mm.soft_empty_cache()
         gc.collect()
-                
-            #print(f"Block {b}: {block_memory:.2f}MB on {block.parameters().__next__().device}")
+
         log.info("----------------------")
         log.info(f"Block swap memory summary:")
         log.info(f"Transformer blocks on {self.offload_device}: {total_offload_memory:.2f}MB")
         log.info(f"Transformer blocks on {self.main_device}: {total_main_memory:.2f}MB")
         log.info(f"Total memory used by transformer blocks: {(total_offload_memory + total_main_memory):.2f}MB")
+        log.info(f"Non-blocking memory transfer: {self.use_non_blocking}")
         log.info("----------------------")
+
+    def forward_vace(
+        self,
+        x,
+        vace_context,
+        seq_len,
+        kwargs
+    ):
+        # embeddings
+        c = [self.vace_patch_embedding(u.unsqueeze(0)) for u in vace_context]
+        c = [u.flatten(2).transpose(1, 2) for u in c]
+        c = torch.cat([
+            torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
+                      dim=1) for u in c
+        ])
+
+        if x.shape[1] != c.shape[1]:
+            c = c[:, :x.shape[1]]
+        
+        c_list = [c]
+        for b, block in enumerate(self.vace_blocks):
+            if b <= self.vace_blocks_to_swap and self.vace_blocks_to_swap >= 0:
+                block.to(self.main_device)
+            c_list = block(
+                c_list, x, 
+                intermediate_device=self.offload_device if self.vace_blocks_to_swap != -1 else self.main_device, 
+                nonblocking=self.use_non_blocking,
+                **kwargs)
+            if b <= self.vace_blocks_to_swap and self.vace_blocks_to_swap >= 0:
+                block.to(self.offload_device, non_blocking=self.use_non_blocking)
+
+        hints = c_list[:-1]
+        
+        return hints
 
     def forward(
         self,
@@ -590,13 +938,16 @@ class WanModel(ModelMixin, ConfigMixin):
         t,
         context,
         seq_len,
+        is_uncond=False,
+        current_step_percentage=0.0,
         clip_fea=None,
         y=None,
         device=torch.device('cuda'),
         freqs=None,
         current_step=0,
         pred_id=None,
-        control_enabled=False,
+        control_lora_enabled=False,
+        vace_data = None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -619,21 +970,29 @@ class WanModel(ModelMixin, ConfigMixin):
             List[Tensor]:
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
         """        
-        if self.model_type == 'i2v':
-            assert clip_fea is not None and y is not None
         # params
-        #device = self.patch_embedding.weight.device
-        if freqs.device != device:
-            freqs = freqs.to(device)
+        device = self.patch_embedding.weight.device
+        if freqs is not None and freqs.device != device:
+           freqs = freqs.to(device)
+
+        _, F, H, W = x[0].shape
             
         if y is not None:
-            x = torch.cat([x, y], dim=0)
+            x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
         # embeddings
-        if control_enabled:
-            x = [self.expanded_patch_embedding(x.unsqueeze(0))]
+        if control_lora_enabled:
+            self.expanded_patch_embedding.to(device)
+            x = [
+            self.expanded_patch_embedding(u.unsqueeze(0))
+            for u in x
+            ]
         else:
-            x = [self.original_patch_embedding(x.unsqueeze(0))]
+            self.original_patch_embedding.to(self.main_device)
+            x = [
+            self.original_patch_embedding(u.unsqueeze(0))
+            for u in x
+            ]
 
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
@@ -644,6 +1003,21 @@ class WanModel(ModelMixin, ConfigMixin):
             torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
                       dim=1) for u in x
         ])
+
+        if freqs is None: #comfy rope
+            rope_func = "comfy"
+            f_len = ((F + (self.patch_size[0] // 2)) // self.patch_size[0])
+            h_len = ((H + (self.patch_size[1] // 2)) // self.patch_size[1])
+            w_len = ((W + (self.patch_size[2] // 2)) // self.patch_size[2])
+            img_ids = torch.zeros((f_len, h_len, w_len, 3), device=x.device, dtype=x.dtype)
+            img_ids[:, :, :, 0] = img_ids[:, :, :, 0] + torch.linspace(0, f_len - 1, steps=f_len, device=x.device, dtype=x.dtype).reshape(-1, 1, 1)
+            img_ids[:, :, :, 1] = img_ids[:, :, :, 1] + torch.linspace(0, h_len - 1, steps=h_len, device=x.device, dtype=x.dtype).reshape(1, -1, 1)
+            img_ids[:, :, :, 2] = img_ids[:, :, :, 2] + torch.linspace(0, w_len - 1, steps=w_len, device=x.device, dtype=x.dtype).reshape(1, 1, -1)
+            img_ids = repeat(img_ids, "t h w c -> b (t h w) c", b=1)
+
+            freqs = self.rope_embedder(img_ids).movedim(1, 2)
+        else:
+            rope_func = "default"
 
         # time embeddings
         with torch.autocast(device_type='cuda', dtype=torch.float32):
@@ -663,21 +1037,23 @@ class WanModel(ModelMixin, ConfigMixin):
                 for u in context
             ]))
         if self.offload_txt_emb:
-            self.text_embedding.to(self.offload_device, non_blocking=True)
+            self.text_embedding.to(self.offload_device, non_blocking=self.use_non_blocking)
 
+        clip_embed = None
         if clip_fea is not None:
+            clip_fea = clip_fea.to(self.main_device)
             if self.offload_img_emb:
                 self.img_emb.to(self.main_device)
-            context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
-            context = torch.concat([context_clip, context], dim=1)
+            clip_embed = self.img_emb(clip_fea)  # bs x 257 x dim
+            #context = torch.concat([context_clip, context], dim=1)
             if self.offload_img_emb:
-                self.img_emb.to(self.offload_device, non_blocking=True)
+                self.img_emb.to(self.offload_device, non_blocking=self.use_non_blocking)
 
         should_calc = True
         accumulated_rel_l1_distance = torch.tensor(0.0, dtype=torch.float32, device=device)
         if self.enable_teacache and self.teacache_start_step <= current_step <= self.teacache_end_step:
             if pred_id is None:
-                pred_id = self.teacache_state.new_prediction()
+                pred_id = self.teacache_state.new_prediction(cache_device=self.teacache_cache_device)
                 #log.info(current_step)
                 #log.info(f"TeaCache: Initializing TeaCache variables for model pred: {pred_id}")
                 should_calc = True                
@@ -688,8 +1064,9 @@ class WanModel(ModelMixin, ConfigMixin):
                 accumulated_rel_l1_distance = self.teacache_state.get(pred_id)['accumulated_rel_l1_distance']
 
                 if self.teacache_use_coefficients:
-                    rescale_func = np.poly1d(self.teacache_coefficients)
-                    accumulated_rel_l1_distance += rescale_func(((e-previous_modulated_input).abs().mean() / previous_modulated_input.abs().mean()).cpu().item())
+                    rescale_func = np.poly1d(self.teacache_coefficients[self.teacache_mode])
+                    temb = e if self.teacache_mode == 'e' else e0
+                    accumulated_rel_l1_distance += rescale_func(((temb-previous_modulated_input).abs().mean() / previous_modulated_input.abs().mean()).cpu().item())
                 else:
                     temb_relative_l1 = relative_l1_distance(previous_modulated_input, e0)
                     accumulated_rel_l1_distance = accumulated_rel_l1_distance.to(e0.device) + temb_relative_l1
@@ -702,19 +1079,20 @@ class WanModel(ModelMixin, ConfigMixin):
                     should_calc = True
                     accumulated_rel_l1_distance = torch.tensor(0.0, dtype=torch.float32, device=device)
 
-            previous_modulated_input = e.clone() if self.teacache_use_coefficients else e0.clone()
+            previous_modulated_input = e.clone() if (self.teacache_use_coefficients and self.teacache_mode == 'e') else e0.clone()
             if not should_calc:
-                x += previous_residual.to(x.device)
+                x = x.to(previous_residual.dtype) + previous_residual.to(x.device)
                 #log.info(f"TeaCache: Skipping uncond step {current_step+1}")
                 self.teacache_state.update(
                     pred_id,
                     accumulated_rel_l1_distance=accumulated_rel_l1_distance,
-                    skipped_steps=self.teacache_state.get(pred_id)['skipped_steps'] + 1,
                 )
+                self.teacache_state.get(pred_id)['skipped_steps'].append(current_step)
 
         if not self.enable_teacache or (self.enable_teacache and should_calc):
             if self.enable_teacache:
-                original_x = x.clone()
+                original_x = x.clone().to(self.teacache_cache_device, non_blocking=self.use_non_blocking)
+
             # arguments
             kwargs = dict(
                 e=e0,
@@ -722,29 +1100,54 @@ class WanModel(ModelMixin, ConfigMixin):
                 grid_sizes=grid_sizes,
                 freqs=freqs,
                 context=context,
-                context_lens=context_lens)
+                context_lens=context_lens,
+                clip_embed=clip_embed,
+                rope_func=rope_func,
+                current_step=current_step,
+                video_attention_split_steps=self.video_attention_split_steps
+                )
+            
+            if vace_data is not None:
+                vace_hint_list = []
+                vace_scale_list = []
+                if isinstance(vace_data[0], dict):
+                    for data in vace_data:
+                        if (data["start"] <= current_step_percentage <= data["end"]) or \
+                            (data["end"] > 0 and current_step == 0 and current_step_percentage >= data["start"]):
+
+                            vace_hints = self.forward_vace(x.to(torch.float32), data["context"], data["seq_len"], kwargs)
+                            vace_hint_list.append(vace_hints)
+                            vace_scale_list.append(data["scale"])
+                else:
+                    vace_hints = self.forward_vace(x.to(torch.float32), vace_data, seq_len, kwargs)
+                    vace_hint_list.append(vace_hints)
+                    vace_scale_list.append(1.0)
+                
+                kwargs['vace_hints'] = vace_hint_list
+                kwargs['vace_context_scale'] = vace_scale_list
 
             for b, block in enumerate(self.blocks):
+                if self.slg_blocks is not None:
+                    if b in self.slg_blocks and is_uncond:
+                        if self.slg_start_percent <= current_step_percentage <= self.slg_end_percent:
+                            continue
                 if b <= self.blocks_to_swap and self.blocks_to_swap >= 0:
                     block.to(self.main_device)
-                x = block(x, **kwargs)
+                x = block(x.to(torch.float32), **kwargs)
                 if b <= self.blocks_to_swap and self.blocks_to_swap >= 0:
-                    block.to(self.offload_device, non_blocking=True)
+                    block.to(self.offload_device, non_blocking=self.use_non_blocking)
 
             if self.enable_teacache and pred_id is not None:
                 self.teacache_state.update(
                     pred_id,
-                    previous_residual=(x - original_x),
-                    accumulated_rel_l1_distance=accumulated_rel_l1_distance,
-                    previous_modulated_input=previous_modulated_input
+                    previous_residual=(x.to(original_x.device) - original_x),
+                    accumulated_rel_l1_distance=accumulated_rel_l1_distance.to(self.teacache_cache_device, non_blocking=self.use_non_blocking),
+                    previous_modulated_input=previous_modulated_input.to(self.teacache_cache_device, non_blocking=self.use_non_blocking)
                 )
-                #self.teacache_state.report()
-
-        # head
         x = self.head(x, e)
-        # unpatchify
-        x = self.unpatchify(x, grid_sizes)
-        return x, pred_id
+        x = self.unpatchify(x, grid_sizes) # type: ignore[arg-type]
+        x = [u.float() for u in x]
+        return (x, pred_id) if pred_id is not None else (x, None)
 
     def unpatchify(self, x, grid_sizes):
         r"""
@@ -763,27 +1166,31 @@ class WanModel(ModelMixin, ConfigMixin):
         """
 
         c = self.out_dim
-        for v in grid_sizes.tolist():
-            x = x[:math.prod(v)].view(*v, *self.patch_size, c)
-            x = torch.einsum('fhwpqrc->cfphqwr', x)
-            x = x.reshape(c, *[i * j for i, j in zip(v, self.patch_size)])
-        return x
+        out = []
+        for u, v in zip(x, grid_sizes.tolist()):
+            u = u[: math.prod(v)].view(*v, *self.patch_size, c)
+            u = torch.einsum("fhwpqrc->cfphqwr", u)
+            u = u.reshape(c, *[i * j for i, j in zip(v, self.patch_size)])
+            out.append(u)
+        return out
 
 class TeaCacheState:
     def __init__(self, cache_device='cpu'):
         self.cache_device = cache_device
+        log.info(f"TeaCache: Using cache device: {self.cache_device}")
         self.states = {}
         self._next_pred_id = 0
     
-    def new_prediction(self):
+    def new_prediction(self, cache_device='cpu'):
         """Create new prediction state and return its ID"""
+        self.cache_device = cache_device
         pred_id = self._next_pred_id
         self._next_pred_id += 1
         self.states[pred_id] = {
             'previous_residual': None,
             'accumulated_rel_l1_distance': 0,
             'previous_modulated_input': None,
-            'skipped_steps': 0
+            'skipped_steps': [],
         }
         return pred_id
     
@@ -792,8 +1199,6 @@ class TeaCacheState:
         if pred_id not in self.states:
             return None
         for key, value in kwargs.items():
-            if isinstance(value, torch.Tensor):
-                value = value.to(self.cache_device)
             self.states[pred_id][key] = value
     
     def get(self, pred_id):
@@ -816,27 +1221,3 @@ def relative_l1_distance(last_tensor, current_tensor):
     norm = torch.abs(last_tensor).mean()
     relative_l1_distance = l1_distance / norm
     return relative_l1_distance.to(torch.float32).to(current_tensor.device)
-
-def normalize_values(values):
-    min_val = min(values)
-    max_val = max(values)
-    if max_val == min_val:
-        return [0.0] * len(values)
-    return [(x - min_val) / (max_val - min_val) for x in values]
-
-def rescale_differences(input_diffs, output_diffs):
-    """Polynomial fitting between input and output differences"""
-    poly_degree = 4
-    if len(input_diffs) < 2:
-        return input_diffs
-    
-    x = np.array([x.item() for x in input_diffs])
-    y = np.array([y.item() for y in output_diffs])
-    print("x ", x)
-    print("y ", y)
-    
-    # Fit polynomial
-    coeffs = np.polyfit(x, y, poly_degree)
-    
-    # Apply polynomial transformation
-    return np.polyval(coeffs, x)

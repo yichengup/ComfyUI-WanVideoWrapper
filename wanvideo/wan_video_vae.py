@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
+from comfy.utils import ProgressBar
 
 CACHE_T = 2
 
@@ -522,6 +523,43 @@ class VideoVAE_(nn.Module):
         x_recon = self.decode(z)
         return x_recon, mu, log_var
 
+
+    #modification originally by @raindrop313 https://github.com/raindrop313/ComfyUI-WanVideoStartEndFrames
+    def encode_2(self, x, scale):
+        self.clear_cache()
+        ## cache
+        t = x.shape[2]
+        iter_ = 2 + (t - 2) // 4
+
+        for i in range(iter_):
+            self._enc_conv_idx = [0]
+            if i == 0:
+                out = self.encoder(x[:, :, :1, :, :],
+                                   feat_cache=self._enc_feat_map,
+                                   feat_idx=self._enc_conv_idx)
+            elif i== iter_-1:
+                out_ = self.encoder(x[:, :, -1:, :, :],
+                                   feat_cache=[None] * self._enc_conv_num,
+                                   feat_idx=self._enc_conv_idx)
+                out = torch.cat([out, out_], 2)
+            else:
+                out_ = self.encoder(x[:, :, 1 + 4 * (i - 1):1 + 4 * i, :, :],
+                                    feat_cache=self._enc_feat_map,
+                                    feat_idx=self._enc_conv_idx)
+                out = torch.cat([out, out_], 2)
+        out_head = out[:, :, :iter_ - 1, :, :]
+        out_tail = out[:, :, -1, :, :].unsqueeze(2)
+        mu, log_var = torch.cat([self.conv1(out_head), self.conv1(out_tail)], dim=2).chunk(2, dim=1)
+        if isinstance(scale[0], torch.Tensor):
+            scale = [s.to(dtype=mu.dtype, device=mu.device) for s in scale]
+            mu = (mu - scale[0].view(1, self.z_dim, 1, 1, 1)) * scale[1].view(
+                1, self.z_dim, 1, 1, 1)
+        else:
+            scale = scale.to(dtype=mu.dtype, device=mu.device)
+            mu = (mu - scale[0]) * scale[1]
+        return mu
+
+
     def encode(self, x, scale):
         self.clear_cache()
         ## cache
@@ -548,6 +586,42 @@ class VideoVAE_(nn.Module):
             scale = scale.to(dtype=mu.dtype, device=mu.device)
             mu = (mu - scale[0]) * scale[1]
         return mu
+
+
+    #modification originally by @raindrop313 https://github.com/raindrop313/ComfyUI-WanVideoStartEndFrames
+    def decode_2(self, z, scale):
+        self.clear_cache()
+        # z: [b,c,t,h,w]
+        if isinstance(scale[0], torch.Tensor):
+            scale = [s.to(dtype=z.dtype, device=z.device) for s in scale]
+            z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
+                1, self.z_dim, 1, 1, 1)
+        else:
+            scale = scale.to(dtype=z.dtype, device=z.device)
+            z = z / scale[1] + scale[0]
+        iter_ = z.shape[2]
+        z_head=z[:,:,:-1,:,:]
+        z_tail=z[:,:,-1,:,:].unsqueeze(2)
+        x = torch.cat([self.conv2(z_head), self.conv2(z_tail)], dim=2)
+        for i in range(iter_):
+            self._conv_idx = [0]
+            if i == 0:
+                out = self.decoder(x[:, :, i:i + 1, :, :],
+                                   feat_cache=self._feat_map,
+                                   feat_idx=self._conv_idx)
+            elif i==iter_-1:
+                out_ = self.decoder(x[:, :, -1, :, :].unsqueeze(2),
+                                    feat_cache=None,
+                                    feat_idx=self._conv_idx)
+                out = torch.cat([out, out_], 2) # may add tensor offload
+            else:
+                out_ = self.decoder(x[:, :, i:i + 1, :, :],
+                                    feat_cache=self._feat_map,
+                                    feat_idx=self._conv_idx)
+                out = torch.cat([out, out_], 2) # may add tensor offload
+        return out
+
+
 
     def decode(self, z, scale):
         self.clear_cache()
@@ -663,6 +737,7 @@ class WanVideoVAE(nn.Module):
         weight = torch.zeros((1, 1, out_T, H * self.upsampling_factor, W * self.upsampling_factor), dtype=hidden_states.dtype, device=data_device)
         values = torch.zeros((1, 3, out_T, H * self.upsampling_factor, W * self.upsampling_factor), dtype=hidden_states.dtype, device=data_device)
 
+        pbar = ProgressBar(len(tasks))
         for h, h_, w, w_ in tqdm(tasks, desc="VAE decoding"):
             hidden_states_batch = hidden_states[:, :, :, h:h_, w:w_].to(computation_device)
             hidden_states_batch = self.model.decode(hidden_states_batch, self.scale).to(data_device)
@@ -689,6 +764,7 @@ class WanVideoVAE(nn.Module):
                 target_h: target_h + hidden_states_batch.shape[3],
                 target_w: target_w + hidden_states_batch.shape[4],
             ] += mask
+            pbar.update(1)
         values = values / weight
         values = values.float().clamp_(-1, 1)
         return values
@@ -696,8 +772,13 @@ class WanVideoVAE(nn.Module):
 
     def tiled_encode(self, video, device, tile_size, tile_stride):
         _, _, T, H, W = video.shape
-        size_h, size_w = tile_size
-        stride_h, stride_w = tile_stride
+        
+        if tile_size is None and tile_stride is None:
+            size_h, size_w = H //2, W // 2
+            stride_h, stride_w = size_h // 2, size_w // 2
+        else:
+            size_h, size_w = tile_size[0] * self.upsampling_factor, tile_size[1] * self.upsampling_factor
+            stride_h, stride_w = tile_stride[0] * self.upsampling_factor, tile_stride[1] * self.upsampling_factor
 
         # Split tasks
         tasks = []
@@ -708,13 +789,14 @@ class WanVideoVAE(nn.Module):
                 h_, w_ = h + size_h, w + size_w
                 tasks.append((h, h_, w, w_))
 
-        data_device = "cpu"
+        data_device = device
         computation_device = device
 
         out_T = (T + 3) // 4
         weight = torch.zeros((1, 1, out_T, H // self.upsampling_factor, W // self.upsampling_factor), dtype=video.dtype, device=data_device)
         values = torch.zeros((1, 16, out_T, H // self.upsampling_factor, W // self.upsampling_factor), dtype=video.dtype, device=data_device)
 
+        pbar = ProgressBar(len(tasks))
         for h, h_, w, w_ in tqdm(tasks, desc="VAE encoding"):
             hidden_states_batch = video[:, :, :, h:h_, w:w_].to(computation_device)
             hidden_states_batch = self.model.encode(hidden_states_batch, self.scale).to(data_device)
@@ -741,6 +823,7 @@ class WanVideoVAE(nn.Module):
                 target_h: target_h + hidden_states_batch.shape[3],
                 target_w: target_w + hidden_states_batch.shape[4],
             ] += mask
+            pbar.update(1)
         values = values / weight
         values = values.float()
         return values
@@ -757,26 +840,37 @@ class WanVideoVAE(nn.Module):
         video = self.model.decode(hidden_state, self.scale)
         return video.float().clamp_(-1, 1)
 
+    def double_encode(self, video, device):
+        print('double_encode')
+        video = video.to(device)
+        x = self.model.encode_2(video, self.scale)
+        return x.float()
 
-    def encode(self, videos, device, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
+    def double_decode(self, hidden_state, device):
+        print('double_decode')
+        hidden_state = hidden_state.to(device)
+        video = self.model.decode_2(hidden_state, self.scale)
+        return video.float().clamp_(-1, 1)
 
+    def encode(self, videos, device, tiled=False,end_=False, tile_size=None, tile_stride=None):
         videos = [video.to("cpu") for video in videos]
         hidden_states = []
         for video in videos:
             video = video.unsqueeze(0)
             if tiled:
-                tile_size = (tile_size[0], tile_size[1])
-                tile_stride = (tile_stride[0], tile_stride[1])
                 hidden_state = self.tiled_encode(video, device, tile_size, tile_stride)
             else:
-                hidden_state = self.single_encode(video, device)
+                if end_:
+                    hidden_state = self.double_encode(video, device)
+                else:
+                    hidden_state = self.single_encode(video, device)
             hidden_state = hidden_state.squeeze(0)
             hidden_states.append(hidden_state)
         hidden_states = torch.stack(hidden_states)
         return hidden_states
 
 
-    def decode(self, hidden_states, device, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
+    def decode(self, hidden_states, device, tiled=False, end_=False, tile_size=(34, 34), tile_stride=(18, 16)):
         hidden_states = [hidden_state.to("cpu") for hidden_state in hidden_states]
         videos = []
         for hidden_state in hidden_states:
@@ -784,7 +878,10 @@ class WanVideoVAE(nn.Module):
             if tiled:
                 video = self.tiled_decode(hidden_state, device, tile_size, tile_stride)
             else:
-                video = self.single_decode(hidden_state, device)
+                if end_:
+                    video = self.double_decode(hidden_state, device)
+                else:
+                    video = self.single_decode(hidden_state, device)
             video = video.squeeze(0)
             videos.append(video)
         return videos
